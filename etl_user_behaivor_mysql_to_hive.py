@@ -1,5 +1,5 @@
+#!/usr/bin/env python3
 from pyspark.sql import SparkSession, functions as F
-
 import argparse
 
 def main():
@@ -14,33 +14,19 @@ def main():
 
     spark = (
         SparkSession.builder
-        .appName("mysql_to_hive_ods_user_behavior_event")
+        .appName("mysql_to_hive_ods_user_behavior_events")
         .enableHiveSupport()
         .getOrCreate()
     )
 
-    spark.sql("SET hive.exec.dynamic.partition=true")
-    spark.sql("SET hive.exec.dynamic.partition.mode=nonstrict")
+    mysql_table = "user_behavior_events"
+    hive_table = "ods.user_behavior_events"
 
-    base_query = """
-        SELECT id, user_id, product_id, category_id, user_behavior,
-               latitude, longitude, event_ts_ms
-        FROM biz_db.user_behavior_event
-    """
-
-    if args.mode == "append":
-        if not args.start_date or not args.end_date:
-            raise ValueError("append 模式必须提供 --start-date 和 --end-date")
-        # event_ts_ms 为毫秒时间戳
-        base_query += f"""
-        WHERE event_ts_ms >= UNIX_TIMESTAMP('{args.start_date}','yyyy-MM-dd')*1000
-          AND event_ts_ms <  UNIX_TIMESTAMP('{args.end_date}','yyyy-MM-dd')*1000
-        """
-
+    # 从 MySQL 读取整个表（利用分区读取加速）
     df = (
         spark.read.format("jdbc")
         .option("url", args.mysql_url)
-        .option("dbtable", f"({base_query}) t")
+        .option("dbtable", mysql_table)
         .option("user", args.mysql_user)
         .option("password", args.mysql_password)
         .option("driver", "com.mysql.cj.jdbc.Driver")
@@ -52,22 +38,22 @@ def main():
         .load()
     )
 
-    df = (
-        df.withColumn("latitude", F.col("latitude").cast("decimal(10,6)"))
-          .withColumn("longitude", F.col("longitude").cast("decimal(10,6)"))
-          .withColumn("dt", F.from_unixtime(F.col("event_ts_ms")/1000, "yyyy-MM-dd"))
-    )
+    # 增量模式：按时间戳过滤
+    if args.mode == "append":
+        if not args.start_date or not args.end_date:
+            raise ValueError("append 模式必须提供 --start-date 和 --end-date")
+        start_ts = int(pd.Timestamp(args.start_date).timestamp() * 1000)  # 毫秒
+        end_ts = int(pd.Timestamp(args.end_date).timestamp() * 1000)
+        df = df.filter((F.col("event_ts_ms") >= start_ts) & (F.col("event_ts_ms") < end_ts))
 
-    target = "ods_db.ods_user_behacvior_event"
-
+    # 写入 Hive（全量覆盖，增量追加）
     if args.mode == "full":
-        # 全量：首次全量导入可直接写入（会生成所有分区）
-        df.write.mode("append").insertInto(target)
+        df.write.mode("overwrite").saveAsTable(hive_table)
     else:
-        # 增量：按时间分区追加写
-        df.write.mode("append").insertInto(target)
+        df.write.mode("append").saveAsTable(hive_table)
 
     spark.stop()
 
 if __name__ == "__main__":
+    import pandas as pd   # 放在这里避免全局导入冲突，也可以用 pyspark 内置方法
     main()
